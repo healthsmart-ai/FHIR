@@ -12,6 +12,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -85,14 +86,14 @@ public class UMLSTermGraphLoader {
         return "property".equals(label) ? "property_" : label;
     }
 
-    private Vertex codeSystemVertex = null;
+    private Map<String, Vertex> codeSystemVertices = new ConcurrentHashMap<>();
     private String conceptFile = null;
     private GraphTraversalSource g = null;
     private FHIRTermGraph graph = null;
     private JanusGraph janusGraph = null;
     private String relationshipFile = null;
     private Map<String, Vertex> vertexMap = null;
-    private Map<String, String> auiToScuiMap = new HashMap<>(100000);
+    private Map<String, String> auiToScuiMap = new ConcurrentHashMap<>(1000000);
 
     public UMLSTermGraphLoader(String propFileName, String conceptFile, String relationshipFile) throws ParseException, IOException, FileNotFoundException {
         ch.qos.logback.classic.Logger rootLogger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
@@ -105,9 +106,6 @@ public class UMLSTermGraphLoader {
         janusGraph = graph.getJanusGraph();
         g = graph.traversal();
         vertexMap = new HashMap<>(250000);
-
-        codeSystemVertex = g.addV("CodeSystem").property("url", "http://umls.info").next();
-        g.tx().commit();
 
         loadConcepts();
         loadRelations();
@@ -129,18 +127,28 @@ public class UMLSTermGraphLoader {
         // CUI, LAT, TS, LUI, STT, SUI, ISPREF, AUI, SAUI, SCUI, SDUI, SAB, TTY, CODE, STR, SRL, SUPPRESS, CVF
         // https://www.ncbi.nlm.nih.gov/books/NBK9685/table/ch03.T.concept_names_and_sources_file_mr/
         //
-        AtomicInteger counter = new AtomicInteger(0);
+        Map<String, AtomicInteger> sabCounters = new HashMap<>();
 
         try (BufferedReader reader = new BufferedReader(new FileReader(conceptFile))) {
-            reader.lines().parallel().forEach(line -> {
+            reader.lines().forEach(line -> {
                 String[] tokens = line.split(UMLS_DELIMITER);
                 String lat = tokens[1];
                 String isPref = tokens[6];
                 String aui = tokens[7];
                 String scui = tokens[9];
+                String sab = tokens[11];
                 String str = tokens[14];
 
                 auiToScuiMap.put(aui, scui);
+
+                Vertex codeSystemVertex = codeSystemVertices.computeIfAbsent(sab, s -> {
+                    Vertex csv = g.addV("CodeSystem").property("url", mapSABToURL(s)).next();
+                    g.tx().commit();
+                    return csv;
+                });
+
+                AtomicInteger counter = sabCounters.computeIfAbsent(sab, s -> new AtomicInteger(0));
+                counter.incrementAndGet();
 
                 Vertex v = null;
                 if (vertexMap.containsKey(scui)) {
@@ -148,6 +156,7 @@ public class UMLSTermGraphLoader {
                 } else {
                     v = g.addV("Concept").property("code", scui).next();
                     vertexMap.put(scui, v);
+
                     g.V(codeSystemVertex).addE("concept").to(v).next();
                 }
                 if (v == null) {
@@ -160,22 +169,30 @@ public class UMLSTermGraphLoader {
                     Vertex w = g.addV("Designation").property("language", lat).property("value", str).next();
                     g.V(v).addE("designation").to(w).next();
 
-                    if ((counter.get() % 10000) == 0) {
-                        LOG.info("counter: " + counter.get());
+                    if ((sabCounters.values().stream().collect(Collectors.summingInt(AtomicInteger::get)) % 10000) == 0) {
+                        String counters = sabCounters.entrySet().stream().map(e -> e.getKey() + ":" + e.getValue()).collect(Collectors.joining(","));
+                        LOG.info("counter: " + counters);
                         g.tx().commit();
                     }
 
                 }
-                counter.getAndIncrement();
+
             });
 
+            for (String sab : sabCounters.keySet()) {
+                int counter = sabCounters.get(sab).get();
+                Vertex codeSystemVertex = codeSystemVertices.get(sab);
+                g.V(codeSystemVertex).property("count", counter).next();
+            }
             // commit any uncommitted work
             g.tx().commit();
         }
 
-        int count = counter.get();
-        g.V(codeSystemVertex).property("count", count).next();
         g.tx().commit();
+    }
+
+    private String mapSABToURL(String sab) {
+        return sab; // FIXME need to implement some mapping from the SAB value to a code-system URL
     }
 
     private void loadRelations() throws FileNotFoundException, IOException {
@@ -186,7 +203,7 @@ public class UMLSTermGraphLoader {
         AtomicInteger counter = new AtomicInteger(0);
 
         try (BufferedReader reader = new BufferedReader(new FileReader(relationshipFile))) {
-            reader.lines().parallel().forEach(line -> {
+            reader.lines().forEach(line -> {
                 String[] tokens = line.split(UMLS_DELIMITER);
                 String aui1 = tokens[1];
                 String rela = tokens[7];
