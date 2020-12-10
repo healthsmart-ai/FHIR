@@ -8,10 +8,14 @@ import java.io.BufferedReader;
 import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.Reader;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
@@ -48,21 +52,20 @@ public class UMLSTermGraphLoader {
             long start = System.currentTimeMillis();
 
             // Parse arguments
-            options = new Options()
-                        .addRequiredOption("file", null, true, "Configuration properties file")
-                        .addRequiredOption("base", null, true, "UMLS base directory")
-                        .addRequiredOption("concept", null, true, "UMLS concept file")
-                        .addRequiredOption("relation", null, true, "UMLS relationship file");
+            options = new Options().addRequiredOption("file", null, true, "Configuration properties file").addRequiredOption("base", null, true, "UMLS base directory")
+                    .addRequiredOption("conceptFile", null, true, "UMLS concept (MRCONSO) file").addRequiredOption("relationFile", null, true, "UMLS relationship (MRREL) file")
+                    .addRequiredOption("sourceAttributeFile", null, true, "UMLS source attribute (MRSAB) file");
 
             CommandLineParser parser = new DefaultParser();
             CommandLine commandLine = parser.parse(options, args);
 
             String baseDir = commandLine.getOptionValue("base");
-            String relationshipFile = baseDir + "/" + commandLine.getOptionValue("relation");
-            String conceptFile = baseDir + "/" + commandLine.getOptionValue("concept");
+            String relationshipFile = baseDir + "/" + commandLine.getOptionValue("relationFile");
+            String conceptFile = baseDir + "/" + commandLine.getOptionValue("conceptFile");
+            String sabFile = baseDir + "/" + commandLine.getOptionValue("sourceAttributeFile");
             String propFileName = commandLine.getOptionValue("file");
 
-            loader = new UMLSTermGraphLoader(propFileName, conceptFile, relationshipFile);
+            loader = new UMLSTermGraphLoader(propFileName, conceptFile, relationshipFile, sabFile);
 
             long end = System.currentTimeMillis();
             LOG.info("Loading time (milliseconds): " + (end - start));
@@ -86,33 +89,34 @@ public class UMLSTermGraphLoader {
         return "property".equals(label) ? "property_" : label;
     }
 
+    private Map<String, String> auiToScuiMap = new ConcurrentHashMap<>(1000000);
+    private Properties codeSystemMap = new Properties();
     private Map<String, Vertex> codeSystemVertices = new ConcurrentHashMap<>();
     private String conceptFile = null;
     private GraphTraversalSource g = null;
     private FHIRTermGraph graph = null;
     private JanusGraph janusGraph = null;
     private String relationshipFile = null;
+    private Map<String, String> sabToVersion = new HashMap<>();
+    private String sourceAttributeFile = null;
     private Map<String, Vertex> vertexMap = null;
-    private Map<String, String> auiToScuiMap = new ConcurrentHashMap<>(1000000);
 
-    public UMLSTermGraphLoader(String propFileName, String conceptFile, String relationshipFile) throws ParseException, IOException, FileNotFoundException {
+    public UMLSTermGraphLoader(String propFileName, String conceptFile, String relationshipFile, String sourceAttributeFile) throws ParseException, IOException, FileNotFoundException {
         ch.qos.logback.classic.Logger rootLogger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
         rootLogger.setLevel(ch.qos.logback.classic.Level.INFO);
 
         this.conceptFile = conceptFile;
         this.relationshipFile = relationshipFile;
+        this.sourceAttributeFile = sourceAttributeFile;
 
         graph = FHIRTermGraphFactory.open(propFileName);
         janusGraph = graph.getJanusGraph();
         g = graph.traversal();
         vertexMap = new HashMap<>(250000);
 
+        loadSourceAttributes();
         loadConcepts();
         loadRelations();
-    }
-
-    public JanusGraph getJanusGraph() {
-        return janusGraph;
     }
 
     public void close() {
@@ -122,12 +126,28 @@ public class UMLSTermGraphLoader {
         }
     }
 
+    private final Vertex getCodeSystemVertex(String sab) {
+        String version = sabToVersion.get(sab);
+        String url = (String) codeSystemMap.getOrDefault(sab, sab);
+
+        Vertex csv = g.addV("CodeSystem").property("url", url).property("version", version).next();
+        g.tx().commit();
+        return csv;
+
+    }
+
+    public JanusGraph getJanusGraph() {
+        return janusGraph;
+    }
+
     private void loadConcepts() throws FileNotFoundException, IOException {
         // MRCONSO.RRF
         // CUI, LAT, TS, LUI, STT, SUI, ISPREF, AUI, SAUI, SCUI, SDUI, SAB, TTY, CODE, STR, SRL, SUPPRESS, CVF
         // https://www.ncbi.nlm.nih.gov/books/NBK9685/table/ch03.T.concept_names_and_sources_file_mr/
         //
-        Map<String, AtomicInteger> sabCounters = new HashMap<>();
+        LOG.info("Loading concepts.....");
+
+        Map<String, AtomicInteger> sabCounterMap = new HashMap<>();
 
         try (BufferedReader reader = new BufferedReader(new FileReader(conceptFile))) {
             reader.lines().forEach(line -> {
@@ -138,61 +158,55 @@ public class UMLSTermGraphLoader {
                 String scui = tokens[9];
                 String sab = tokens[11];
                 String str = tokens[14];
+                String suppress = tokens[16];
+                if (!"O".equals(suppress)) {
 
-                auiToScuiMap.put(aui, scui);
+                    auiToScuiMap.put(aui, scui);
 
-                Vertex codeSystemVertex = codeSystemVertices.computeIfAbsent(sab, s -> {
-                    Vertex csv = g.addV("CodeSystem").property("url", mapSABToURL(s)).next();
-                    g.tx().commit();
-                    return csv;
-                });
+                    Vertex codeSystemVertex = codeSystemVertices.computeIfAbsent(sab, s -> getCodeSystemVertex(s));
 
-                AtomicInteger counter = sabCounters.computeIfAbsent(sab, s -> new AtomicInteger(0));
-                counter.incrementAndGet();
+                    AtomicInteger counter = sabCounterMap.computeIfAbsent(sab, s -> new AtomicInteger(0));
+                    counter.incrementAndGet();
 
-                Vertex v = null;
-                if (vertexMap.containsKey(scui)) {
-                    v = vertexMap.get(scui);
-                } else {
-                    v = g.addV("Concept").property("code", scui).next();
-                    vertexMap.put(scui, v);
+                    Vertex v = null;
+                    if (vertexMap.containsKey(scui)) {
+                        v = vertexMap.get(scui);
+                    } else {
+                        v = g.addV("Concept").property("code", scui).next();
+                        vertexMap.put(scui, v);
 
-                    g.V(codeSystemVertex).addE("concept").to(v).next();
-                }
-                if (v == null) {
-                    LOG.severe("Could not find SCUI in vertexMap");
-                } else {
-                    if (isPref.equals("Y")) { // Preferred entries provide preferred name and language
-                        v.property("display", str).property("language", lat);
+                        g.V(codeSystemVertex).addE("concept").to(v).next();
                     }
-                    // add new designation
-                    Vertex w = g.addV("Designation").property("language", lat).property("value", str).next();
-                    g.V(v).addE("designation").to(w).next();
+                    if (v == null) {
+                        LOG.severe("Could not find SCUI in vertexMap");
+                    } else {
+                        if (isPref.equals("Y")) { // Preferred entries provide preferred name and language
+                            v.property("display", str).property("language", lat);
+                        }
+                        // add new designation
+                        Vertex w = g.addV("Designation").property("language", lat).property("value", str).next();
+                        g.V(v).addE("designation").to(w).next();
 
-                    if ((sabCounters.values().stream().collect(Collectors.summingInt(AtomicInteger::get)) % 10000) == 0) {
-                        String counters = sabCounters.entrySet().stream().map(e -> e.getKey() + ":" + e.getValue()).collect(Collectors.joining(","));
-                        LOG.info("counter: " + counters);
-                        g.tx().commit();
+                        if ((sabCounterMap.values().stream().collect(Collectors.summingInt(AtomicInteger::get)) % 10000) == 0) {
+                            String counters = sabCounterMap.entrySet().stream().map(e -> e.getKey() + ":" + e.getValue()).collect(Collectors.joining(","));
+                            LOG.info("counter: " + counters);
+                            g.tx().commit();
+                        }
+
                     }
-
                 }
-
             });
 
-            for (String sab : sabCounters.keySet()) {
-                int counter = sabCounters.get(sab).get();
-                Vertex codeSystemVertex = codeSystemVertices.get(sab);
-                g.V(codeSystemVertex).property("count", counter).next();
+            for (Entry<String, AtomicInteger> entry : sabCounterMap.entrySet()) {
+                Vertex codeSystemVertex = codeSystemVertices.get(entry.getKey());
+                g.V(codeSystemVertex).property("count", entry.getValue().get()).next();
             }
             // commit any uncommitted work
             g.tx().commit();
         }
 
         g.tx().commit();
-    }
-
-    private String mapSABToURL(String sab) {
-        return sab; // FIXME need to implement some mapping from the SAB value to a code-system URL
+        LOG.info("Done loading concepts.....");
     }
 
     private void loadRelations() throws FileNotFoundException, IOException {
@@ -200,6 +214,8 @@ public class UMLSTermGraphLoader {
         // CUI1, AUI1, STYPE1, REL, CUI2, AUI2, STYPE2, RELA, RUI, SRUI, SAB, SL, RG,DIR, SUPPRESS, CVF
         // https://www.ncbi.nlm.nih.gov/books/NBK9685/table/ch03.T.related_concepts_file_mrrel_rrf/
         //
+        LOG.info("Loading relations.....");
+
         AtomicInteger counter = new AtomicInteger(0);
 
         try (BufferedReader reader = new BufferedReader(new FileReader(relationshipFile))) {
@@ -208,42 +224,67 @@ public class UMLSTermGraphLoader {
                 String aui1 = tokens[1];
                 String rela = tokens[7];
                 String aui2 = tokens[5];
+                String dir = tokens[13];
+                String suppress = tokens[14];
+                if (!"N".equals(dir) || !"O".equals(suppress)) { // Don't load relations that are not in source order or suppressed 
 
-                String scui1 = auiToScuiMap.get(aui1);
-                String scui2 = auiToScuiMap.get(aui2);
-                if (scui1 == null) {
-                    System.err.println("Could not find Vertex: " + aui1);
-                } else if (scui2 == null) {
-                    System.err.println("Could not find Vertex: " + aui2);
-                } else {
-                    Vertex v1 = vertexMap.get(scui1);
-                    Vertex v2 = vertexMap.get(scui2);
+                    String scui1 = auiToScuiMap.get(aui1);
+                    String scui2 = auiToScuiMap.get(aui2);
+                    if (scui1 != null && scui2 != null) {
+                        Vertex v1 = vertexMap.get(scui1);
+                        Vertex v2 = vertexMap.get(scui2);
 
-                    if (v1 != null && v2 != null) {
-                        String label = toLabel(rela);
+                        if (v1 != null && v2 != null) {
+                            String label = toLabel(rela);
 
-                        if (janusGraph.getEdgeLabel(label) == null) {
-                            System.err.println("Adding label: " + label);
-                            JanusGraphManagement management = janusGraph.openManagement();
-                            management.makeEdgeLabel(label).make();
-                            management.commit();
+                            if (janusGraph.getEdgeLabel(label) == null) {
+                                LOG.info("Adding label: " + label);
+                                JanusGraphManagement management = janusGraph.openManagement();
+                                management.makeEdgeLabel(label).make();
+                                management.commit();
+                            }
+
+                            Edge e = g.V(v1).addE(label).to(v2).next();
+                            g.E(e).next();
                         }
 
-                        Edge e = g.V(v1).addE(label).to(v2).next();
-                        g.E(e).next();
-                    }
+                        if ((counter.get() % 10000) == 0) {
+                            LOG.info("counter: " + counter.get());
+                            g.tx().commit();
+                        }
 
-                    if ((counter.get() % 10000) == 0) {
-                        LOG.info("counter: " + counter.get());
-                        g.tx().commit();
+                        counter.getAndIncrement();
                     }
-
-                    counter.getAndIncrement();
                 }
             });
 
             // commit any uncommitted work
             g.tx().commit();
+            LOG.info("Done loading relations.....");
+        }
+    }
+
+    private void loadSourceAttributes() throws IOException {
+        try (Reader codeSystemReader = new InputStreamReader(getClass().getClassLoader().getResourceAsStream("conf/umlsCodesystemMap.properties"))) {
+            // Load UMLS name to preferred CodeSystem name map
+            codeSystemMap.load(codeSystemReader);
+        }
+
+        try (BufferedReader reader = new BufferedReader(new FileReader(sourceAttributeFile))) {
+            // Load latest version for code systems in UMLS
+            reader.lines().forEach(line -> {
+                String[] tokens = line.split(UMLS_DELIMITER);
+                String rsab = tokens[3];
+                String sver = tokens[6];
+                String curver = tokens[21];
+                if ("Y".equals(curver)) {
+                    if ("SNOMEDCT_US".equals(rsab)) {
+                        // special case version for SNOMED
+                        sver = "http://snomed.info/sct/731000124108/version/" + sver.replaceAll("_", "");
+                    }
+                    sabToVersion.put(rsab, sver);
+                }
+            });
         }
     }
 }
