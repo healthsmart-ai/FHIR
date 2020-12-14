@@ -39,12 +39,21 @@ import org.slf4j.LoggerFactory;
 import com.ibm.fhir.term.graph.FHIRTermGraph;
 import com.ibm.fhir.term.graph.FHIRTermGraphFactory;
 
+/*
+ * This class will load UMLS concepts and relationships into a JanusGraph.
+ */
+
 public class UMLSTermGraphLoader {
 
     private static final Logger LOG = Logger.getLogger(UMLSTermGraphLoader.class.getName());
 
     private static final String UMLS_DELIMITER = "\\|";
 
+    /**
+     * Load UMLS data using properties provided in arguments
+     * 
+     * @param args
+     */
     public static void main(String[] args) {
         UMLSTermGraphLoader loader = null;
         Options options = null;
@@ -52,8 +61,11 @@ public class UMLSTermGraphLoader {
             long start = System.currentTimeMillis();
 
             // Parse arguments
-            options = new Options().addRequiredOption("file", null, true, "Configuration properties file").addRequiredOption("base", null, true, "UMLS base directory")
-                    .addRequiredOption("conceptFile", null, true, "UMLS concept (MRCONSO) file").addRequiredOption("relationFile", null, true, "UMLS relationship (MRREL) file")
+            options = new Options()
+                    .addRequiredOption("file", null, true, "Configuration properties file")
+                    .addRequiredOption("base", null, true, "UMLS base directory")
+                    .addRequiredOption("conceptFile", null, true, "UMLS concept (MRCONSO) file")
+                    .addRequiredOption("relationFile", null, true, "UMLS relationship (MRREL) file")
                     .addRequiredOption("sourceAttributeFile", null, true, "UMLS source attribute (MRSAB) file");
 
             CommandLineParser parser = new DefaultParser();
@@ -66,6 +78,7 @@ public class UMLSTermGraphLoader {
             String propFileName = commandLine.getOptionValue("file");
 
             loader = new UMLSTermGraphLoader(propFileName, conceptFile, relationshipFile, sabFile);
+            loader.load();
 
             long end = System.currentTimeMillis();
             LOG.info("Loading time (milliseconds): " + (end - start));
@@ -82,6 +95,12 @@ public class UMLSTermGraphLoader {
         }
     }
 
+    /**
+     * Generate a consistent label for the given type, removing _ and - characters and camel-casing the resulting string
+     * 
+     * @param typeName
+     * @return
+     */
     private static String toLabel(String typeName) {
         List<String> tokens = Arrays.asList(typeName.split("_|-"));
         String label = tokens.stream().map(token -> token.substring(0, 1).toUpperCase() + token.substring(1)).collect(Collectors.joining(""));
@@ -89,19 +108,46 @@ public class UMLSTermGraphLoader {
         return "property".equals(label) ? "property_" : label;
     }
 
+    // Map to track AUI to SCUI relationships, since MRREL uses AUI, but granularity of concepts used in MRCONSO is at SCUI level
     private Map<String, String> auiToScuiMap = new ConcurrentHashMap<>(1000000);
+    
+    // Map of code system name to preferred label, configured in properties file
     private Properties codeSystemMap = new Properties();
+    
+    // Map of code system id to corresponding vertex
     private Map<String, Vertex> codeSystemVertices = new ConcurrentHashMap<>();
+    
+    // Name of file containing UMLS concept data
     private String conceptFile = null;
+    
     private GraphTraversalSource g = null;
     private FHIRTermGraph graph = null;
     private JanusGraph janusGraph = null;
+    
+    // Name of file containing UMLS concept relationship data
     private String relationshipFile = null;
+    
+    // Map of abbreviated source name to the current version of that source 
     private Map<String, String> sabToVersion = new HashMap<>();
+    
+    // Name of file containing source data
     private String sourceAttributeFile = null;
+    
+    // Map of concept name to corresponding vertex
     private Map<String, Vertex> vertexMap = null;
 
-    public UMLSTermGraphLoader(String propFileName, String conceptFile, String relationshipFile, String sourceAttributeFile) throws ParseException, IOException, FileNotFoundException {
+    /**
+     * Initialize a UMLSTermGraphLoader
+     * 
+     * @param propFileName
+     * @param conceptFile
+     * @param relationshipFile
+     * @param sourceAttributeFile
+     * @throws ParseException
+     * @throws IOException
+     * @throws FileNotFoundException
+     */
+    public UMLSTermGraphLoader(String propFileName, String conceptFile, String relationshipFile, String sourceAttributeFile) {
         ch.qos.logback.classic.Logger rootLogger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
         rootLogger.setLevel(ch.qos.logback.classic.Level.INFO);
 
@@ -114,11 +160,24 @@ public class UMLSTermGraphLoader {
         g = graph.traversal();
         vertexMap = new HashMap<>(250000);
 
+    }
+
+    /**
+     * Loads UMLS data into JanusGraph
+     * 
+     * @throws ParseException
+     * @throws IOException
+     * @throws FileNotFoundException
+     */
+    public void load() throws ParseException, IOException, FileNotFoundException {
         loadSourceAttributes();
         loadConcepts();
         loadRelations();
     }
 
+    /**
+     * Close loader, thereby closing connection to JanusGraph
+     */
     public void close() {
         if (graph != null) {
             graph.close();
@@ -126,7 +185,13 @@ public class UMLSTermGraphLoader {
         }
     }
 
-    private final Vertex getCodeSystemVertex(String sab) {
+    /**
+     * Create a code system vertex for the provided abbreviated source name 
+     * 
+     * @param sab
+     * @return
+     */
+    private final Vertex createCodeSystemVertex(String sab) {
         String version = sabToVersion.get(sab);
         String url = (String) codeSystemMap.getOrDefault(sab, sab);
 
@@ -140,6 +205,12 @@ public class UMLSTermGraphLoader {
         return janusGraph;
     }
 
+    /**
+     * Loads all UMLS concept data from the provided conceptFile
+     * 
+     * @throws FileNotFoundException
+     * @throws IOException
+     */
     private void loadConcepts() throws FileNotFoundException, IOException {
         // MRCONSO.RRF
         // CUI, LAT, TS, LUI, STT, SUI, ISPREF, AUI, SAUI, SCUI, SDUI, SAB, TTY, CODE, STR, SRL, SUPPRESS, CVF
@@ -163,7 +234,7 @@ public class UMLSTermGraphLoader {
 
                     auiToScuiMap.put(aui, scui);
 
-                    Vertex codeSystemVertex = codeSystemVertices.computeIfAbsent(sab, s -> getCodeSystemVertex(s));
+                    Vertex codeSystemVertex = codeSystemVertices.computeIfAbsent(sab, s -> createCodeSystemVertex(s));
 
                     AtomicInteger counter = sabCounterMap.computeIfAbsent(sab, s -> new AtomicInteger(0));
                     counter.incrementAndGet();
@@ -209,6 +280,13 @@ public class UMLSTermGraphLoader {
         LOG.info("Done loading concepts.....");
     }
 
+    
+    /**
+     * Loads all UMLS relationship data from the provided relationshipFile
+     * 
+     * @throws FileNotFoundException
+     * @throws IOException
+     */
     private void loadRelations() throws FileNotFoundException, IOException {
         // MRREL
         // CUI1, AUI1, STYPE1, REL, CUI2, AUI2, STYPE2, RELA, RUI, SRUI, SAB, SL, RG,DIR, SUPPRESS, CVF
@@ -226,7 +304,7 @@ public class UMLSTermGraphLoader {
                 String aui2 = tokens[5];
                 String dir = tokens[13];
                 String suppress = tokens[14];
-                if (!"N".equals(dir) && !"O".equals(suppress)) { // Don't load relations that are not in source order or suppressed 
+                if (!"N".equals(dir) && !"O".equals(suppress)) { // Don't load relations that are not in source order or suppressed
 
                     String scui1 = auiToScuiMap.get(aui1);
                     String scui2 = auiToScuiMap.get(aui2);
@@ -264,6 +342,11 @@ public class UMLSTermGraphLoader {
         }
     }
 
+    /**
+     * Loads all UMLS sourcea attribute data from the provided sourceAttributeFile
+     * 
+     * @throws IOException
+     */
     private void loadSourceAttributes() throws IOException {
         try (Reader codeSystemReader = new InputStreamReader(getClass().getClassLoader().getResourceAsStream("conf/umlsCodesystemMap.properties"))) {
             // Load UMLS name to preferred CodeSystem name map
