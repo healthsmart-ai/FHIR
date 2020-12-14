@@ -226,7 +226,7 @@ public class UMLSTermGraphLoader {
                 String aui2 = tokens[5];
                 String dir = tokens[13];
                 String suppress = tokens[14];
-                if (!"N".equals(dir) || !"O".equals(suppress)) { // Don't load relations that are not in source order or suppressed 
+                if (!"N".equals(dir) && !"O".equals(suppress)) { // Don't load relations that are not in source order or suppressed 
 
                     String scui1 = auiToScuiMap.get(aui1);
                     String scui2 = auiToScuiMap.get(aui2);
@@ -244,7 +244,7 @@ public class UMLSTermGraphLoader {
                                 management.commit();
                             }
 
-                            Edge e = g.V(v1).addE(label).to(v2).next();
+                            Edge e = g.V(v2).addE(label).to(v1).next();
                             g.E(e).next();
                         }
 
