@@ -10,12 +10,16 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.Reader;
+import java.text.Normalizer;
+import java.text.Normalizer.Form;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
@@ -110,29 +114,32 @@ public class UMLSTermGraphLoader {
 
     // Map to track AUI to SCUI relationships, since MRREL uses AUI, but granularity of concepts used in MRCONSO is at SCUI level
     private Map<String, String> auiToScuiMap = new ConcurrentHashMap<>(1000000);
-    
+
     // Map of code system name to preferred label, configured in properties file
     private Properties codeSystemMap = new Properties();
-    
+
+    // Set of code systems which are case sensitive, configured in properties file
+    private Set<String> caseSensitiveCodeSystems = new HashSet<>();
+
     // Map of code system id to corresponding vertex
     private Map<String, Vertex> codeSystemVertices = new ConcurrentHashMap<>();
-    
+
     // Name of file containing UMLS concept data
     private String conceptFile = null;
-    
+
     private GraphTraversalSource g = null;
     private FHIRTermGraph graph = null;
     private JanusGraph janusGraph = null;
-    
+
     // Name of file containing UMLS concept relationship data
     private String relationshipFile = null;
-    
-    // Map of abbreviated source name to the current version of that source 
+
+    // Map of abbreviated source name to the current version of that source
     private Map<String, String> sabToVersion = new HashMap<>();
-    
+
     // Name of file containing source data
     private String sourceAttributeFile = null;
-    
+
     // Map of concept name to corresponding vertex
     private Map<String, Vertex> vertexMap = null;
 
@@ -171,6 +178,7 @@ public class UMLSTermGraphLoader {
      */
     public void load() throws ParseException, IOException, FileNotFoundException {
         loadSourceAttributes();
+        loadCaseSensitiveCodeSystems();
         loadConcepts();
         loadRelations();
     }
@@ -186,7 +194,7 @@ public class UMLSTermGraphLoader {
     }
 
     /**
-     * Create a code system vertex for the provided abbreviated source name 
+     * Create a code system vertex for the provided abbreviated source name
      * 
      * @param sab
      * @return
@@ -195,7 +203,11 @@ public class UMLSTermGraphLoader {
         String version = sabToVersion.get(sab);
         String url = (String) codeSystemMap.getOrDefault(sab, sab);
 
-        Vertex csv = g.addV("CodeSystem").property("url", url).property("version", version).next();
+        boolean caseSensitive = false;
+        if (caseSensitiveCodeSystems.contains(sab)) {
+            caseSensitive = true;
+        }
+        Vertex csv = g.addV("CodeSystem").property("url", url).property("version", version).property("caseSensitive", caseSensitive).next();
         g.tx().commit();
         return csv;
 
@@ -224,10 +236,10 @@ public class UMLSTermGraphLoader {
             reader.lines().forEach(line -> {
                 String[] tokens = line.split(UMLS_DELIMITER);
                 String lat = tokens[1];
-                String isPref = tokens[6];
                 String aui = tokens[7];
                 String scui = tokens[9];
                 String sab = tokens[11];
+                String tty = tokens[12];
                 String str = tokens[14];
                 String suppress = tokens[16];
                 if (!"O".equals(suppress)) {
@@ -243,7 +255,8 @@ public class UMLSTermGraphLoader {
                     if (vertexMap.containsKey(scui)) {
                         v = vertexMap.get(scui);
                     } else {
-                        v = g.addV("Concept").property("code", scui).next();
+                        String codeLowerCase = normalizeForSearch(scui);
+                        v = g.addV("Concept").property("code", scui).property("codeLowerCase", codeLowerCase).next();
                         vertexMap.put(scui, v);
 
                         g.V(codeSystemVertex).addE("concept").to(v).next();
@@ -251,8 +264,12 @@ public class UMLSTermGraphLoader {
                     if (v == null) {
                         LOG.severe("Could not find SCUI in vertexMap");
                     } else {
-                        if (isPref.equals("Y")) { // Preferred entries provide preferred name and language
-                            v.property("display", str).property("language", lat);
+                        if (tty.equals("PT")) { // Preferred entries provide preferred name and language
+                            String displayLowerCase = normalizeForSearch(lat);
+                            v.property("display", str);
+                            v.property("displayLowerCase", displayLowerCase);
+                            v.property("language", lat);
+
                         }
                         // add new designation
                         Vertex w = g.addV("Designation").property("language", lat).property("value", str).next();
@@ -280,7 +297,13 @@ public class UMLSTermGraphLoader {
         LOG.info("Done loading concepts.....");
     }
 
-    
+    private static String normalizeForSearch(String value) {
+        if (value != null) {
+            return Normalizer.normalize(value, Form.NFD).replaceAll("\\p{InCombiningDiacriticalMarks}+", "").toLowerCase();
+        }
+        return null;
+    }
+
     /**
      * Loads all UMLS relationship data from the provided relationshipFile
      * 
@@ -343,7 +366,7 @@ public class UMLSTermGraphLoader {
     }
 
     /**
-     * Loads all UMLS sourcea attribute data from the provided sourceAttributeFile
+     * Loads all UMLS source attribute data from the provided sourceAttributeFile
      * 
      * @throws IOException
      */
@@ -368,6 +391,20 @@ public class UMLSTermGraphLoader {
                     sabToVersion.put(rsab, sver);
                 }
             });
+        }
+    }
+
+    /**
+     * Loads configuration of code systems noted to be case sensitive
+     * 
+     * @throws IOException
+     */
+    private void loadCaseSensitiveCodeSystems() throws IOException {
+        try (BufferedReader reader = new BufferedReader(new FileReader("conf/umlsSourceCaseSensitivity.txt"))) {
+            String line = reader.readLine().trim();
+            if (!line.isEmpty()) {
+                caseSensitiveCodeSystems.add(reader.readLine());
+            }
         }
     }
 }
