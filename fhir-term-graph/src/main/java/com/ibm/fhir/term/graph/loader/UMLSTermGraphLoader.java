@@ -265,7 +265,7 @@ public class UMLSTermGraphLoader {
                         LOG.severe("Could not find SCUI in vertexMap");
                     } else {
                         if (tty.equals("PT")) { // Preferred entries provide preferred name and language
-                            String displayLowerCase = normalizeForSearch(lat);
+                            String displayLowerCase = normalizeForSearch(str);
                             v.property("display", str);
                             v.property("displayLowerCase", displayLowerCase);
                             v.property("language", lat);
@@ -400,7 +400,7 @@ public class UMLSTermGraphLoader {
      * @throws IOException
      */
     private void loadCaseSensitiveCodeSystems() throws IOException {
-        try (BufferedReader reader = new BufferedReader(new FileReader("conf/umlsSourceCaseSensitivity.txt"))) {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(getClass().getClassLoader().getResourceAsStream("conf/umlsSourceCaseSensitivity.txt")))) {
             String line = reader.readLine().trim();
             if (!line.isEmpty()) {
                 caseSensitiveCodeSystems.add(reader.readLine());
